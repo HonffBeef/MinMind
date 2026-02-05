@@ -92,11 +92,73 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def norm(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * x
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * x
     
     def forward(self, x):
         return self.weight * self.norm(x)
+
+
+
+def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6,
+                         rope_scaling: Optional[dict] = None):
+ 
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    
+    # YARN缩放：用于外推到更长序列
+    if rope_scaling is not None:
+        # 使用dict.get()方法获取值，提供默认值
+        # 元组解包：同时赋值多个变量
+        orig_max, factor, beta_fast, beta_slow = (
+            rope_scaling.get("original_max_position_embeddings", 2048), 
+            rope_scaling.get("factor", 4),
+            rope_scaling.get("beta_fast", 4.0), 
+            rope_scaling.get("beta_slow", 1.0)
+        )
+        
+        # 只有当序列长度超过原始长度时才应用缩放
+        if end / orig_max > 1.0:
+            # next()函数：找到第一个满足条件的元素
+            # 生成器表达式：(i for i in ... if condition)
+            # 找到需要校正的维度边界
+            corr_dim = next((i for i in range(dim // 2) if 2 * math.pi / freqs[i] > orig_max), dim // 2)
+            
+            # 计算每个维度的插值权重
+            # max(..., 1): 防止除零
+            power = torch.arange(0, dim // 2, device=freqs.device).float() / max(dim // 2 - 1, 1)
+            # 线性插值计算beta值
+            beta = beta_slow + (beta_fast - beta_slow) * power
+            
+            # YaRN缩放公式：λ = (β·α - β + 1)/(β·α)
+            # torch.where(): 条件选择，相当于 condition ? value1 : value2
+            scale = torch.where(
+                torch.arange(dim // 2, device=freqs.device) < corr_dim, 
+                (beta * factor - beta + 1) / (beta * factor),  # 高频部分使用复杂缩放
+                1.0 / factor                                    # 低频部分简单缩放
+            )
+            freqs = freqs * scale
+
+    t = torch.arange(end, device=freqs.device)
+
+    freqs = torch.outer(t, freqs).float()
+    
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+    
+    return freqs_cos, freqs_sin
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    def rotate_half(x):
+
+        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+      
+    # RoPE旋转公式：x_rotated = x*cos + rotate_half(x)*sin
+    # .unsqueeze(unsqueeze_dim): 在指定维度增加一个维度，用于广播
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+    return q_embed, k_embed
+
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -230,25 +292,21 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    #初始化
-    #升维
-    #降维
-    #门控
-    #dropout
-    #激活函数
-    def __init__(self, args: MokioMindConfig):
+    def __init__(self, config: MokioMindConfig):
         super().__init__()
-        if args.intermediate_size is None:
-            intermediate_size = int(args.hidden_size * 8 / 3)
-            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+        # ACT2FN是transformers里激活函数的映射表，支持'silu','gelu'等
+        self.act_fn = ACT2FN[config.hidden_act]
 
-        # FIX: 命名和forward保持一致
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-
-        self.dropout = nn.Dropout(args.dropout)
-        self.act_fn = ACT2FN[args.hidden_act]
+    def forward(self, x):
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
 
     def forward(self, x):
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
@@ -293,6 +351,7 @@ class MokioMindBlock(nn.Module):
 class MokioMindModel(nn.Module):
     def __init__(self, config: MokioMindConfig):
         super().__init__()
+        self.config = config
 
         # FIX: 统一字段名
         self.vocab_size, self.num_hidden_layers = (
@@ -386,7 +445,6 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.lm_head.weight = self.model.embed_tokens.weight
 
 
-        self.OUT = CausalLMOutputWithPast()
 
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
@@ -411,8 +469,8 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
 
          # 使用PretrainedModel约定的输出容器CausalLMOutputWithPast
          # 通过__setitem__方式填充键值，保持与Hugging Face接口兼容
-         self.OUT.__setitem__('last_hidden_state', h)
-         self.OUT.__setitem__('logits', logits)
-         self.OUT.__setitem__('aux_loss', aux_loss)
-         self.OUT.__setitem__('past_key_values', past_kvs)
-         return self.OUT
+         return CausalLMOutputWithPast(
+             logits=logits,
+             past_key_values=past_key_values,
+             hidden_states=h
+         )

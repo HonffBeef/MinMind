@@ -1,0 +1,13 @@
+# weights / checkpoints
+checkpoints/
+out/
+
+# datasets
+dataset/*.jsonl
+dataset/**/*.jsonl
+
+# 其他常见
+*.pth
+*.pt
+*.bin
+*.ckpt

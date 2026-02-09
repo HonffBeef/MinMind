@@ -11,6 +11,7 @@ from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+
 # huggingface的类
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
@@ -93,10 +94,12 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * x
+        # FIX: 正确的RMSNorm，不要重复乘x
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
     
     def forward(self, x):
-        return self.weight * self.norm(x)
+        # FIX: 调用 _norm 而不是不存在的 self.norm
+        return self.weight * self._norm(x)
 
 
 
@@ -223,6 +226,11 @@ class Attention(nn.Module):
         # ---- RoPE (FIX: 避免双重position偏移；这里直接用传进来的cos/sin) ----
         cos, sin = position_embeddings
         past_len = past_key_value[0].size(1) if past_key_value is not None else 0  # 仍保留给mask对齐使用
+
+        # FIX: 半精度时避免被 cos/sin(float32) 把 q/k upcast，导致后续 Linear dtype 不匹配
+        cos = cos.to(dtype=xq.dtype)
+        sin = sin.to(dtype=xq.dtype)
+
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
         # ---- KV cache concat ----
@@ -251,7 +259,8 @@ class Attention(nn.Module):
                 raise ValueError(f"attention_mask last dim ({attention_mask.size(-1)}) != k_len ({k_len})")
 
         # ---- Attention ----
-        if self.flash and q_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
+        # FIX: flash + is_causal=True 在 k_len!=q_len（有cache且一次喂多token）时会产生错误mask，这里只在 past_len==0 时启用
+        if self.flash and past_len == 0 and q_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
             # (FIX: bool mask 语义：True 表示被 mask 掉)
             attn_mask = None
             if attention_mask is not None:
@@ -303,10 +312,6 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         # ACT2FN是transformers里激活函数的映射表，支持'silu','gelu'等
         self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-        return self.dropout(self.down_proj(gated))
 
     def forward(self, x):
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
@@ -453,24 +458,26 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
-         h, past_kvs, aux_loss = self.model(
+        # FIX: MokioMindModel 只返回 (hidden_states, presents)
+        h, past_kvs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            **args)
+            **args
+        )
          
-         # logits_to_keep用于在序列末尾保留一部分logits（用于截断或微调策略）
-         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # logits_to_keep用于在序列末尾保留一部分logits（用于截断或微调策略）
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
-          # 通过lm_head将hidden states投影到词表logits
-          # h: [bsz, seq_len, hidden]
-         logits = self.lm_head(h[:, slice_indices, :])
+        # 通过lm_head将hidden states投影到词表logits
+        # h: [bsz, seq_len, hidden]
+        logits = self.lm_head(h[:, slice_indices, :])
 
-         # 使用PretrainedModel约定的输出容器CausalLMOutputWithPast
-         # 通过__setitem__方式填充键值，保持与Hugging Face接口兼容
-         return CausalLMOutputWithPast(
-             logits=logits,
-             past_key_values=past_key_values,
-             hidden_states=h
-         )
+        # 使用PretrainedModel约定的输出容器CausalLMOutputWithPast
+        # 通过__setitem__方式填充键值，保持与Hugging Face接口兼容
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_kvs,   # FIX: 返回本轮更新后的cache
+            hidden_states=h
+        )

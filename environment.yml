@@ -1,0 +1,6 @@
+name: minimind
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip

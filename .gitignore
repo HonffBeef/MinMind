@@ -1,4 +1,43 @@
-model/__pycache__
-out
-website/
-docs-minimind/
+# ====== Python ======
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.pytest_cache/
+
+# ====== VSCode ======
+.vscode/
+
+# ====== OS ======
+.DS_Store
+Thumbs.db
+
+# ====== Training outputs / checkpoints ======
+out/
+checkpoints/
+runs/
+logs/
+
+# model weights
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# ====== Datasets (keep only small samples) ======
+dataset/*.jsonl
+dataset/*.json
+dataset/*.parquet
+dataset/*.arrow
+dataset/*.txt
+!dataset/sample/
+!dataset/sample/**
+
+# ====== Conda / env ======
+.conda/
+.env
+.venv/
+
+# ====== HF cache (optional) ======
+.cache/
